@@ -82,7 +82,7 @@ class LLMAtToolPlugin(Star):
             return True, ""
 
         if not isinstance(event, AiocqhttpMessageEvent):
-            return False, "当前平台不支持 全体权限校验"
+            return False, "当前平台不支持@全体权限校验"
 
         sender_getter = getattr(event, "get_sender_id", None)
         sender_id = sender_getter() if callable(sender_getter) else None
@@ -129,57 +129,127 @@ class LLMAtToolPlugin(Star):
     async def inject_at_instruction(
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
-        if not self.llm_prompt:
+        """
+        在 LLM（大语言模型）发出请求前注入系统提示词。
+        告知模型如何使用特定的 XML 标签格式来进行艾特操作。
+        """
+        instruction = self.llm_prompt
+        req.system_prompt = (req.system_prompt or "") + instruction
+
+        if not self.permission_verification:
             return
 
-        if self.permission_verification:
-            at_all_allowed, deny_message = await self._get_at_all_permission_result(
-                event
+        allowed, deny_message = await self._get_at_all_permission_result(event)
+        if allowed:
+            req.system_prompt += (
+                "\n当前操作者具备@全体权限。"
+                "\n如用户明确要求且场景确有必要，你可以输出 [at:all]。"
             )
-            if not at_all_allowed:
-                safe_gid = self._safe_get_group_id(event)
-                sender_getter = getattr(event, "get_sender_id", lambda: None)
-                sender_id = sender_getter() if callable(sender_getter) else None
-                logger.info(
-                    "拦截越权@全体并降级为普通文本: "
-                    f"group_id={safe_gid}, "
-                    f"sender_id={sender_id}, "
-                    f"reason={deny_message}"
-                )
-                self.llm_prompt += (
-                    "\n\n注意：当前用户无权使用 @全体 功能，请不要在回复中使用 [at:all] 标签。"
-                )
-            else:
-                self.llm_prompt += (
-                    "\n\n你可以使用 [at:all] 标签来 @全体 群成员。"
-                )
+            return
 
-        req.system_prompt += self.llm_prompt
-
-    @filter.command("atall")
-    async def atall_handler(
-        self, event: AstrMessageEvent
-    ):
-        at_all_allowed, deny_message = await self._get_at_all_permission_result(
-            event
+        req.system_prompt += (
+            "\n当前操作者不具备@全体权限。"
+            f"\n原因：{deny_message}"
+            "\n禁止输出 [at:all]。"
+            "\n如果用户要求@全体，请直接用自然语言说明无法执行，不要输出任何 @全体 标签。"
         )
-        if at_all_allowed:
-            await event.send_message([Plain("你可以使用 @全体 功能。")])
-        else:
-            await event.send_message(
-                [Plain(f"你无权使用 @全体 功能。原因: {deny_message}")]
+
+    @filter.llm_tool(name="get_group_members")
+    async def get_group_members(
+        self, event: AstrMessageEvent, keyword: str = ""
+    ) -> str:
+        """
+        供 LLM 调用的工具：获取当前群聊的成员列表。
+
+        Args:
+            keyword(string): 搜索关键词，支持匹配昵称、群名片或QQ号。若为空则返回全员。
+        """
+        start_time = time.time()
+
+        group_id = self._safe_get_group_id(event)
+        if not group_id:
+            return json.dumps(
+                {"status": "error", "message": "当前不在群聊环境中，无法查询成员。"},
+                ensure_ascii=False,
             )
 
-    @filter.permission_type(filter.PermissinType.GROUP)
-    @filter.command_filter(lambda event: hasattr(event, "message") and "[at:" in event.message)
-    async def atall_filter(self, event: AstrMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return json.dumps(
+                {"status": "error", "message": "当前平台协议暂不支持获取群成员。"},
+                ensure_ascii=False,
+            )
+
+        try:
+            raw_members = await event.bot.api.call_action(
+                "get_group_member_list", group_id=group_id
+            )
+            if not raw_members:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "message": "无法获取成员列表或机器人权限不足。",
+                    },
+                    ensure_ascii=False,
+                )
+
+            formatted_members = []
+
+            for m in raw_members:
+                user_id = str(m.get("user_id", ""))
+                nickname = m.get("nickname", "")
+                card = m.get("card", "")
+                role = m.get("role", "member")
+
+                search_content = f"{user_id}{nickname}{card}"
+                if keyword and keyword not in search_content:
+                    continue
+
+                role_map = {"owner": "群主", "admin": "管理员", "member": "成员"}
+                role_cn = role_map.get(role, "成员")
+
+                formatted_members.append(
+                    {
+                        "user_id": user_id,
+                        "nickname": nickname,
+                        "group_card": card if card else "无",
+                        "role": role_cn,
+                    }
+                )
+
+            output_data = {
+                "status": "success",
+                "group_id": group_id,
+                "count": len(formatted_members),
+                "members": formatted_members,
+            }
+
+            logger.debug(
+                f"群成员查询成功：耗时 {time.time() - start_time:.2f}s，共找到 {len(formatted_members)} 人"
+            )
+            return json.dumps(output_data, ensure_ascii=False, indent=2)
+
+        except Exception as e:
+            logger.error(f"查询群成员过程发生异常: {e}")
+            return json.dumps(
+                {"status": "error", "message": f"系统内部异常: {str(e)}"},
+                ensure_ascii=False,
+            )
+
+    @filter.on_decorating_result(priority=2)
+    async def process_at_tags(self, event: AstrMessageEvent):
+        """
+        拦截器：在消息发送给用户前，对LLM输出的内容进行二次处理。
+        功能：
+        1. 识别[at:数字]并转换为平台原生的At组件。
+        2. 自动清理 At 标签周边的空格。
+        3. 注入零宽字符以防止文本渲染时出现格式错乱。
+        """
         result = event.get_result()
-        if not result:
+        if not result or not result.chain:
             return
 
         has_tag = False
         has_at_all_tag = False
-
         for comp in result.chain:
             if isinstance(comp, Plain) and "[at:" in comp.text:
                 has_tag = True
