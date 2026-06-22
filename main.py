@@ -170,20 +170,6 @@ class LLMAtToolPlugin(Star):
                 [Plain(f"你无权使用 @全体 功能。原因: {deny_message}")]
             )
 
-    @filter.message_command("atall_check")
-    async def atall_msg_check(
-        self, event: AstrMessageEvent
-    ):
-        at_all_allowed, deny_message = await self._get_at_all_permission_result(
-            event
-        )
-        if at_all_allowed:
-            await event.send_message([Plain("你可以使用 @全体 功能。")])
-        else:
-            await event.send_message(
-                [Plain(f"你无权使用 @全体 功能。原因: {deny_message}")]
-            )
-
     @filter.permission_type(filter.PermissinType.GROUP)
     @filter.command_filter(lambda event: hasattr(event, "message") and "[at:" in event.message)
     async def atall_filter(self, event: AstrMessageEvent):
