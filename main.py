@@ -1,4 +1,4 @@
-﻿import re
+import re
 import json
 import time
 from typing import List, Optional, Tuple
@@ -56,26 +56,43 @@ class LLMAtToolPlugin(Star):
             return "无法识别他的身份,拒绝执行"
         return f"{sender_id}{reason_suffix}"
 
-    def _safe_get_group_id(self, event: AstrMessageEvent):
-        """安全获取 group_id，兼容 ContextWrapper 和 AiocqhttpMessageEvent"""
-        group_id = None
+    def _get_group_openid(self, event: AstrMessageEvent) -> Optional[str]:
+        """获取群聊的 group_openid，优先从事件上下文中提取。"""
+        group_openid = getattr(event, "group_openid", None)
+        if group_openid:
+            return str(group_openid)
         try:
             gid = getattr(event, "get_group_id", None)
             if callable(gid):
-                group_id = gid()
-            else:
-                group_id = gid
+                result = gid()
+                if result:
+                    return str(result)
         except Exception:
             pass
-        if not group_id:
-            group_id = getattr(event, "group_id", None)
-        return group_id
+        return None
+
+    def _get_sender_openid(self, event: AstrMessageEvent) -> Optional[str]:
+        """获取发送者的 member_openid。"""
+        sender_openid = getattr(event, "sender_openid", None) or getattr(
+            event, "member_openid", None
+        )
+        if sender_openid:
+            return str(sender_openid)
+        try:
+            getter = getattr(event, "get_sender_id", None)
+            if callable(getter):
+                result = getter()
+                if result:
+                    return str(result)
+        except Exception:
+            pass
+        return None
 
     async def _check_at_all_permission(
         self, event: AstrMessageEvent
     ) -> Tuple[bool, str]:
-        group_id = self._safe_get_group_id(event)
-        if not group_id:
+        group_openid = self._get_group_openid(event)
+        if not group_openid:
             return False, "非群聊场景"
 
         if self._is_bot_super_admin(event):
@@ -84,31 +101,56 @@ class LLMAtToolPlugin(Star):
         if not isinstance(event, AiocqhttpMessageEvent):
             return False, "当前平台不支持@全体权限校验"
 
-        sender_getter = getattr(event, "get_sender_id", None)
-        sender_id = sender_getter() if callable(sender_getter) else None
-        if not sender_id:
+        sender_openid = self._get_sender_openid(event)
+        if not sender_openid:
             return False, self._build_sender_identity_reason(
-                sender_id, "的身份,拒绝执行"
+                sender_openid, "的身份,拒绝执行"
             )
 
         try:
-            group_member_info = await event.bot.api.call_action(
-                "get_group_member_info",
-                group_id=group_id,
-                user_id=sender_id,
-            )
+            start_index = 0
+            limit = 500
+            while True:
+                payload = {
+                    "group_openid": group_openid,
+                    "start_index": start_index,
+                    "limit": limit,
+                }
+                body_json = json.dumps(payload, ensure_ascii=False)
+                json.loads(body_json)
+
+                resp = await event.bot.api._http.request(
+                    "POST",
+                    f"/v2/groups/{group_openid}/members",
+                    json=json.loads(body_json),
+                )
+
+                members = resp.get("members", []) if isinstance(resp, dict) else []
+                for member in members:
+                    mid = member.get("member_openid", "")
+                    if mid == sender_openid:
+                        role = str(member.get("role", "member")).lower()
+                        if role in {"owner", "admin"}:
+                            return True, ""
+                        return False, self._build_sender_identity_reason(
+                            sender_openid, " 不是群主、管理员或 Bot 超级管理员"
+                        )
+
+                next_index = resp.get("next_index", 0)
+                if not next_index or start_index >= next_index:
+                    return (
+                        False,
+                        self._build_sender_identity_reason(
+                            sender_openid, " 不在群成员列表中"
+                        ),
+                    )
+                start_index = next_index
+
         except Exception as exc:
             logger.warning(
-                f"查询@全体权限失败: group_id={group_id}, user_id={sender_id}, error={exc}"
+                f"查询@全体权限失败: group_openid={group_openid}, sender_openid={sender_openid}, error={exc}"
             )
             return False, "查询群成员权限失败"
-
-        role = str(group_member_info.get("role", "member")).lower()
-        if role in {"owner", "admin"}:
-            return True, ""
-        return False, self._build_sender_identity_reason(
-            sender_id, " 不是群主、管理员或 Bot 超级管理员"
-        )
 
     async def _get_at_all_permission_result(
         self, event: AstrMessageEvent
@@ -162,69 +204,86 @@ class LLMAtToolPlugin(Star):
         供 LLM 调用的工具：获取当前群聊的成员列表。
 
         Args:
-            keyword(string): 搜索关键词，支持匹配昵称、群名片或QQ号。若为空则返回全员。
+            keyword(string): 搜索关键词，支持匹配昵称、群名片或openid。若为空则返回全员。
         """
         start_time = time.time()
 
-        group_id = self._safe_get_group_id(event)
-        if not group_id:
+        group_openid = self._get_group_openid(event)
+        if not group_openid:
             return json.dumps(
                 {"status": "error", "message": "当前不在群聊环境中，无法查询成员。"},
                 ensure_ascii=False,
             )
 
-        if not isinstance(event, AiocqhttpMessageEvent):
-            return json.dumps(
-                {"status": "error", "message": "当前平台协议暂不支持获取群成员。"},
-                ensure_ascii=False,
-            )
-
         try:
-            raw_members = await event.bot.api.call_action(
-                "get_group_member_list", group_id=group_id
-            )
-            if not raw_members:
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "message": "无法获取成员列表或机器人权限不足。",
-                    },
-                    ensure_ascii=False,
+            all_members = []
+            start_index = 0
+            limit = 500
+
+            while True:
+                payload = {
+                    "group_openid": group_openid,
+                    "start_index": start_index,
+                    "limit": limit,
+                }
+                body_json = json.dumps(payload, ensure_ascii=False)
+                json.loads(body_json)
+
+                resp = await event.bot.api._http.request(
+                    "POST",
+                    f"/v2/groups/{group_openid}/members",
+                    json=json.loads(body_json),
                 )
 
-            formatted_members = []
+                if not isinstance(resp, dict):
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "message": "无法获取成员列表或机器人权限不足。",
+                        },
+                        ensure_ascii=False,
+                    )
 
-            for m in raw_members:
-                user_id = str(m.get("user_id", ""))
-                nickname = m.get("nickname", "")
-                card = m.get("card", "")
-                role = m.get("role", "member")
+                members_data = resp.get("members", [])
+                if not members_data:
+                    break
 
-                search_content = f"{user_id}{nickname}{card}"
-                if keyword and keyword not in search_content:
-                    continue
+                for m in members_data:
+                    member_openid = str(m.get("member_openid", ""))
+                    nickname = m.get("nickname", "")
+                    card = m.get("card", "")
+                    role_raw = m.get("role", "member")
+                    role_cn = {"owner": "群主", "admin": "管理员", "member": "成员"}.get(
+                        str(role_raw), "成员"
+                    )
 
-                role_map = {"owner": "群主", "admin": "管理员", "member": "成员"}
-                role_cn = role_map.get(role, "成员")
+                    search_content = f"{member_openid}{nickname}{card}"
+                    if keyword and keyword not in search_content:
+                        continue
 
-                formatted_members.append(
-                    {
-                        "user_id": user_id,
-                        "nickname": nickname,
-                        "group_card": card if card else "无",
-                        "role": role_cn,
-                    }
-                )
+                    all_members.append(
+                        {
+                            "member_openid": member_openid,
+                            "nickname": nickname,
+                            "group_card": card if card else "无",
+                            "role": role_cn,
+                        }
+                    )
+
+                next_index = resp.get("next_index", 0)
+                if not next_index or start_index >= next_index:
+                    break
+                start_index = next_index
 
             output_data = {
                 "status": "success",
-                "group_id": group_id,
-                "count": len(formatted_members),
-                "members": formatted_members,
+                "group_openid": group_openid,
+                "count": len(all_members),
+                "members": all_members,
             }
 
             logger.debug(
-                f"群成员查询成功：耗时 {time.time() - start_time:.2f}s，共找到 {len(formatted_members)} 人"
+                f"群成员查询成功：耗时 {time.time() - start_time:.2f}s，共找到 {len(all_members)} 人"
             )
             return json.dumps(output_data, ensure_ascii=False, indent=2)
 
@@ -265,12 +324,12 @@ class LLMAtToolPlugin(Star):
                 event
             )
             if not at_all_allowed:
-                safe_gid = self._safe_get_group_id(event)
+                safe_gid = self._get_group_openid(event)
                 sender_getter = getattr(event, "get_sender_id", lambda: None)
                 sender_id = sender_getter() if callable(sender_getter) else None
                 logger.info(
                     "拦截越权@全体并降级为普通文本: "
-                    f"group_id={safe_gid}, "
+                    f"group_openid={safe_gid}, "
                     f"sender_id={sender_id}, "
                     f"reason={deny_message}"
                 )
@@ -343,3 +402,4 @@ class LLMAtToolPlugin(Star):
             idx += 1
 
         result.chain = new_chain
+
